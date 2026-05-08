@@ -1,0 +1,32 @@
+[package]
+name = "taskmaster"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/config",
+    "crates/logger",
+    "crates/process",
+    "crates/signals",
+    "crates/tui",
+    "crates/utils",
+]
+
+[[bin]]
+name = "taskmaster"
+path = "bin/main.rs"
+
+[dependencies]
+ctrlc = "3.4"
+config = { path = "crates/config" }
+logger = { path = "crates/logger" }
+process = { path = "crates/process" }
+tui = { path = "crates/tui" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3

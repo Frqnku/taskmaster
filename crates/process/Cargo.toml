@@ -1,0 +1,10 @@
+[package]
+name = "process"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+config = { path = "../config" }
+logger = { path = "../logger" }
+shlex = "1.1"
+libc = "0.2"

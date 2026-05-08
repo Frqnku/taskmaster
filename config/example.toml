@@ -1,0 +1,26 @@
+# Example taskmaster configuration
+# Run with: taskmaster config/example.toml
+# Note: Log paths should exist or be writable. Adjust paths for your system.
+# On Windows this sample uses `cmd /C timeout ...` so it runs without extra tools.
+# On Linux/macOS, replace the `cmd` values with `sleep` or your preferred command.
+
+[programs.web]
+cmd = "sleep 10"
+numprocs = 2
+autostart = true
+autorestart = "always"
+exitcodes = [0]
+startretries = 3
+starttime = 2
+log = "./logs/web.log"
+umask = 0o027
+
+[programs.api]
+cmd = "sleep 5"
+numprocs = 1
+autostart = true
+autorestart = "unexpected"
+exitcodes = [0]
+starttime = 1
+log = "./logs/api.log"
+umask = 0o027
