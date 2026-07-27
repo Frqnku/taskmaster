@@ -1,0 +1,45 @@
+# Linux/macOS evaluation configuration.
+# Omit stdout/stderr to discard output. Paths below demonstrate redirection.
+
+[programs.worker]
+cmd = "while true; do echo $TASKMASTER_MESSAGE; sleep 2; done"
+numprocs = 2
+autostart = true
+autorestart = "unexpected"
+exitcodes = [0]
+startretries = 3
+starttime = 1
+stopsignal = "TERM"
+stoptime = 2
+stdout = "/tmp/taskmaster-worker.out"
+stderr = "/tmp/taskmaster-worker.err"
+log = "/tmp/taskmaster-worker.lifecycle.log"
+workingdir = "/tmp"
+umask = 0o027
+
+[programs.worker.env]
+TASKMASTER_MESSAGE = "managed by taskmaster"
+
+# Demonstrates startup retries and the FATAL state.
+[programs.failing]
+cmd = "exit 42"
+autostart = false
+autorestart = "unexpected"
+exitcodes = [0]
+startretries = 2
+starttime = 1
+stopsignal = "TERM"
+stoptime = 1
+
+# Short-lived commands are valid when starttime is zero.
+[programs.oneshot]
+cmd = "ls -la"
+autostart = false
+autorestart = "never"
+exitcodes = [0]
+startretries = 0
+starttime = 0
+stopsignal = "TERM"
+stoptime = 1
+stdout = "/tmp/taskmaster-oneshot.out"
+stderr = "/tmp/taskmaster-oneshot.err"

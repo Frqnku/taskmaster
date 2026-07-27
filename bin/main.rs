@@ -1,121 +1,65 @@
 use std::env;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use config::model::Config;
-use logger;
-use process::supervisor::Supervisor;
+use process::Supervisor;
 use tui::Shell;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Get config file path from command line arguments
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <config-file>", args[0]);
-        eprintln!("Example: {} config/example.toml", args[0]);
+    let mut arguments = env::args();
+    let executable = arguments.next().unwrap_or_else(|| "taskmaster".to_string());
+    let Some(config_argument) = arguments.next() else {
+        eprintln!("Usage: {} <config-file>", executable);
+        std::process::exit(1);
+    };
+    if arguments.next().is_some() {
+        eprintln!("Usage: {} <config-file>", executable);
         std::process::exit(1);
     }
 
-    let config_path = &args[1];
+    let config_path = PathBuf::from(config_argument)
+        .canonicalize()
+        .map_err(|error| format!("Cannot open configuration file: {}", error))?;
+    let config = Config::load_from_path(&config_path)
+        .map_err(|error| format!("Failed to load config: {}", error))?;
 
-    // Check if config file exists
-    if !Path::new(config_path).exists() {
-        eprintln!("Error: config file '{}' not found", config_path);
-        std::process::exit(1);
-    }
+    std::fs::create_dir_all("./logs")?;
+    logger::init_global("./logs/taskmaster.log")?;
+    signals::install().map_err(|error| format!("Failed to install signal handlers: {}", error))?;
 
-    println!("Loading config from: {}", config_path);
+    println!("Loaded configuration: {}", config_path.display());
+    println!(
+        "Programs: {}",
+        config
+            .programs
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
-    // Load the configuration
-    let config = Config::load_from_path(config_path).map_err(|e| {
-        format!("Failed to load config: {}", e)
-    })?;
-
-    println!("Config loaded successfully!");
-    println!("Programs to supervise: {}", config.programs.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
-
-    // Initialize global logger (fallback for events without per-program logs)
-    // Create logs directory if it doesn't exist
-    std::fs::create_dir_all("./logs").ok();
-    let global_log = "./logs/taskmaster.log";
-    logger::init_global(global_log).map_err(|e| {
-        format!("Failed to initialize logger: {}", e)
-    })?;
-    println!("Global logger initialized: {}", global_log);
-
-    // Log each per-program log path
-    for (name, program) in &config.programs {
-        if let Some(log_path) = &program.log {
-            println!("  {} -> {}", name, log_path);
-        } else {
-            println!("  {} -> (using global fallback)", name);
-        }
-    }
-
-    // Create supervisor from config
-    // Collect autostart programs before moving config
-    let autostart_programs: Vec<String> = config.programs
+    let autostart_programs: Vec<String> = config
+        .programs
         .iter()
         .filter(|(_, program)| program.autostart)
         .map(|(name, _)| name.clone())
         .collect();
-
     let mut supervisor = Supervisor::from_config(config);
-
-    // Start programs that have autostart enabled
     for name in autostart_programs {
-        if let Err(e) = supervisor.start_program(&name) {
-            eprintln!("Warning: Failed to start program '{}': {:?}", name, e);
+        if let Err(error) = supervisor.start_program(&name) {
+            eprintln!("Autostart {} failed: {}", name, error);
         }
     }
 
-    // Setup graceful shutdown signal handling
-    let running = Arc::new(AtomicBool::new(true));
-    let running_clone = Arc::clone(&running);
-    let signal_notice = Arc::new(AtomicBool::new(false));
-    let signal_notice_clone = Arc::clone(&signal_notice);
-
-    // Handle Ctrl+C (SIGINT)
-    ctrlc::set_handler(move || {
-        if !signal_notice_clone.swap(true, Ordering::SeqCst) {
-            println!("\n\nReceived shutdown signal. Stopping supervisor...");
-        }
-        running_clone.store(false, Ordering::SeqCst);
-    }).expect("Error setting Ctrl-C handler");
-
-    // Start the supervisor
-    println!("\nStarting supervisor...");
     supervisor.start();
-    println!("Supervisor started. Ready for commands.\n");
+    let shell_result = Shell::run(&supervisor, &config_path);
 
-    // Run the interactive shell in the main thread
-    // The shell will manage shutdown when user types 'quit'
-    match Shell::run(&supervisor, Arc::clone(&running)) {
-        Ok(_) => {
-            // User quit the shell, proceed to shutdown
-            println!();
-        }
-        Err(e) => {
-            eprintln!("Shell error: {}", e);
-        }
-    }
-
-    running.store(false, Ordering::SeqCst);
-
-    // Stop the supervisor gracefully
-    println!("Stopping supervisor...");
+    println!("Stopping supervised processes...");
     supervisor.stop();
-    
-    // Wait for all supervised processes to stop (max 10 seconds)
-    println!("Waiting for processes to stop...");
-    if supervisor.wait_for_all_stopped(10) {
-        println!("All processes stopped cleanly.");
-    } else {
-        eprintln!("Warning: Some processes did not stop within timeout.");
+    if !supervisor.wait_for_all_stopped(1) {
+        eprintln!("Some supervised processes could not be stopped.");
     }
-    
-    println!("Supervisor stopped. Exiting.");
+    println!("Taskmaster stopped.");
 
-    Ok(())
+    shell_result.map_err(Into::into)
 }

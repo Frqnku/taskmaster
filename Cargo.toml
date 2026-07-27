@@ -19,10 +19,10 @@ name = "taskmaster"
 path = "bin/main.rs"
 
 [dependencies]
-ctrlc = "3.4"
 config = { path = "crates/config" }
 logger = { path = "crates/logger" }
 process = { path = "crates/process" }
+signals = { path = "crates/signals" }
 tui = { path = "crates/tui" }
 
 [profile.dev]

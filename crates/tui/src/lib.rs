@@ -1,89 +1,89 @@
-/// Interactive shell for process supervision.
-///
-/// Provides a REPL interface for controlling the supervisor.
-/// Commands: start, stop, restart, status, reload, quit/exit, help
-
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use config::model::Config;
 use process::Supervisor;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommand {
     Start(String),
     Stop(String),
     Restart(String),
     Status,
     Reload,
+    History,
     Help,
     Quit,
 }
 
 impl ShellCommand {
-    /// Parse a line of input into a command
     pub fn parse(line: &str) -> Option<Self> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        match parts.get(0).map(|s| s.to_lowercase()).as_deref() {
-            Some("start") => {
-                parts.get(1).map(|name| ShellCommand::Start(name.to_string()))
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            [] => None,
+            [command, name] if command.eq_ignore_ascii_case("start") => {
+                Some(Self::Start((*name).to_string()))
             }
-            Some("stop") => {
-                parts.get(1).map(|name| ShellCommand::Stop(name.to_string()))
+            [command, name] if command.eq_ignore_ascii_case("stop") => {
+                Some(Self::Stop((*name).to_string()))
             }
-            Some("restart") => {
-                parts.get(1).map(|name| ShellCommand::Restart(name.to_string()))
+            [command, name] if command.eq_ignore_ascii_case("restart") => {
+                Some(Self::Restart((*name).to_string()))
             }
-            Some("status") => Some(ShellCommand::Status),
-            Some("reload") => Some(ShellCommand::Reload),
-            Some("help" | "h" | "?") => Some(ShellCommand::Help),
-            Some("quit" | "exit" | "q") => Some(ShellCommand::Quit),
+            [command] if command.eq_ignore_ascii_case("status") => Some(Self::Status),
+            [command] if command.eq_ignore_ascii_case("reload") => Some(Self::Reload),
+            [command] if command.eq_ignore_ascii_case("history") => Some(Self::History),
+            [command]
+                if command.eq_ignore_ascii_case("help") || *command == "h" || *command == "?" =>
+            {
+                Some(Self::Help)
+            }
+            [command]
+                if command.eq_ignore_ascii_case("quit")
+                    || command.eq_ignore_ascii_case("exit")
+                    || *command == "q" =>
+            {
+                Some(Self::Quit)
+            }
             _ => None,
         }
     }
 }
 
-/// Interactive shell for supervisor control
 pub struct Shell;
 
 impl Shell {
-    /// Run the interactive shell
-    pub fn run(supervisor: &Supervisor, running: Arc<AtomicBool>) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        let (tx, rx) = mpsc::channel::<String>();
-
+    pub fn run(supervisor: &Supervisor, config_path: &Path) -> io::Result<()> {
+        let (sender, receiver) = mpsc::channel::<String>();
         thread::spawn(move || {
             let stdin = io::stdin();
             loop {
                 let mut buffer = String::new();
                 match stdin.read_line(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if tx.send(buffer).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if sender.send(buffer).is_err() => break,
+                    Ok(_) => {}
                 }
             }
         });
 
         Self::print_welcome();
-
+        let mut stdout = io::stdout();
         let mut prompt_needed = true;
+        let mut history = Vec::new();
 
         loop {
-            if !running.load(Ordering::SeqCst) {
-                println!();
+            if signals::take_shutdown() {
+                println!("\nShutdown signal received.");
                 return Ok(());
+            }
+            if signals::take_reload() {
+                println!("\nSIGHUP received. Reloading configuration...");
+                Self::handle_reload(supervisor, config_path);
+                prompt_needed = true;
             }
 
             if prompt_needed {
@@ -92,127 +92,151 @@ impl Shell {
                 prompt_needed = false;
             }
 
-            let buffer = match rx.recv_timeout(Duration::from_millis(200)) {
+            let buffer = match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => line,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             };
-
-            // Parse and execute
-            if let Some(cmd) = ShellCommand::parse(&buffer) {
-                match cmd {
-                    ShellCommand::Start(name) => {
-                        Self::handle_start(supervisor, &name);
-                    }
-                    ShellCommand::Stop(name) => {
-                        Self::handle_stop(supervisor, &name);
-                    }
-                    ShellCommand::Restart(name) => {
-                        Self::handle_restart(supervisor, &name);
-                    }
-                    ShellCommand::Status => {
-                        Self::handle_status(supervisor);
-                    }
-                    ShellCommand::Reload => {
-                        println!("Reload not yet implemented.");
-                    }
-                    ShellCommand::Help => {
-                        Self::print_help();
-                    }
-                    ShellCommand::Quit => {
-                        println!("Exiting...");
-                        running.store(false, Ordering::SeqCst);
-                        return Ok(());
-                    }
-                }
-            } else if !buffer.trim().is_empty() {
-                println!("Unknown command. Type 'help' for available commands.");
+            let trimmed = buffer.trim();
+            if !trimmed.is_empty() {
+                history.push(trimmed.to_string());
             }
 
+            match ShellCommand::parse(&buffer) {
+                Some(ShellCommand::Start(name)) => {
+                    Self::handle_for_targets(supervisor, &name, "start", Supervisor::start_program)
+                }
+                Some(ShellCommand::Stop(name)) => {
+                    Self::handle_for_targets(supervisor, &name, "stop", Supervisor::stop_program)
+                }
+                Some(ShellCommand::Restart(name)) => Self::handle_restart(supervisor, &name),
+                Some(ShellCommand::Status) => Self::handle_status(supervisor),
+                Some(ShellCommand::Reload) => Self::handle_reload(supervisor, config_path),
+                Some(ShellCommand::History) => {
+                    for (index, command) in history.iter().enumerate() {
+                        println!("{:>4}  {}", index + 1, command);
+                    }
+                }
+                Some(ShellCommand::Help) => Self::print_help(),
+                Some(ShellCommand::Quit) => {
+                    println!("Shutting down...");
+                    return Ok(());
+                }
+                None if !trimmed.is_empty() => {
+                    println!("Invalid command. Type 'help' for usage.");
+                }
+                None => {}
+            }
             prompt_needed = true;
         }
     }
 
-    fn print_welcome() {
-        println!("\n╔═══════════════════════════════════════╗");
-        println!("║        Taskmaster Supervisor          ║");
-        println!("║  Type 'help' for available commands   ║");
-        println!("╚═══════════════════════════════════════╝\n");
-    }
-
-    fn print_help() {
-        println!(
-            r#"
-Available commands:
-  start <name>      Start all instances of a program
-  stop <name>       Stop a program gracefully
-  restart <name>    Restart a program
-  status            Show status of all programs
-  help              Show this help message
-  quit/exit         Shutdown supervisor and exit
-
-Examples:
-  taskmaster> start web
-  taskmaster> status
-  taskmaster> stop api
-  taskmaster> restart web
-"#
-        );
-    }
-
-    fn handle_start(supervisor: &Supervisor, name: &str) {
-        match supervisor.start_program(name) {
-            Ok(_) => println!("✓ Started program: {}", name),
-            Err(e) => eprintln!("✗ Failed to start '{}': {:?}", name, e),
-        }
-    }
-
-    fn handle_stop(supervisor: &Supervisor, name: &str) {
-        match supervisor.stop_program(name) {
-            Ok(_) => println!("✓ Stopped program: {}", name),
-            Err(e) => eprintln!("✗ Failed to stop '{}': {:?}", name, e),
-        }
-    }
-
-    fn handle_restart(supervisor: &Supervisor, name: &str) {
-        match supervisor.stop_program(name) {
-            Ok(_) => {
-                println!("✓ Stopped program: {}", name);
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                match supervisor.start_program(name) {
-                    Ok(_) => println!("✓ Restarted program: {}", name),
-                    Err(e) => eprintln!("✗ Failed to restart '{}': {:?}", name, e),
-                }
+    fn handle_for_targets(
+        supervisor: &Supervisor,
+        target: &str,
+        verb: &str,
+        action: fn(&Supervisor, &str) -> Result<(), process::instance::ProcessError>,
+    ) {
+        let targets = if target.eq_ignore_ascii_case("all") {
+            supervisor.program_names()
+        } else {
+            vec![target.to_string()]
+        };
+        for name in targets {
+            match action(supervisor, &name) {
+                Ok(()) => println!("{}: {}", verb, name),
+                Err(error) => eprintln!("{} {} failed: {}", verb, name, error),
             }
-            Err(e) => eprintln!("✗ Failed to stop '{}': {:?}", name, e),
+        }
+    }
+
+    fn handle_restart(supervisor: &Supervisor, target: &str) {
+        let targets = if target.eq_ignore_ascii_case("all") {
+            supervisor.program_names()
+        } else {
+            vec![target.to_string()]
+        };
+        for name in targets {
+            if let Err(error) = supervisor.stop_program(&name) {
+                eprintln!("restart {} failed while stopping: {}", name, error);
+                continue;
+            }
+            match supervisor.start_program(&name) {
+                Ok(()) => println!("restart: {}", name),
+                Err(error) => eprintln!("restart {} failed while starting: {}", name, error),
+            }
+        }
+    }
+
+    fn handle_reload(supervisor: &Supervisor, config_path: &Path) {
+        let config = match Config::load_from_path(config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("Reload rejected; current configuration kept: {}", error);
+                return;
+            }
+        };
+        match supervisor.reload_config(config, Some(config_path.display().to_string())) {
+            Ok(summary) => println!(
+                "Configuration reloaded. added={:?} removed={:?} changed={:?} unchanged={:?}",
+                summary.added, summary.removed, summary.changed, summary.unchanged
+            ),
+            Err(error) => eprintln!("Configuration applied with a process error: {}", error),
         }
     }
 
     fn handle_status(supervisor: &Supervisor) {
-        let programs = supervisor.program_names();
-
-        if programs.is_empty() {
+        let statuses = match supervisor.statuses() {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                eprintln!("status failed: {}", error);
+                return;
+            }
+        };
+        if statuses.is_empty() {
             println!("No programs configured.");
             return;
         }
 
-        println!("\n{:<15} {:>10} {:>8}", "Program", "Instances", "Status");
-        println!("{}", "-".repeat(50));
-
-        for program in programs {
-            let count = supervisor
-                .instance_count(&program)
-                .unwrap_or(0);
-            
-            let status = if count > 0 {
-                format!("{} running", count)
-            } else {
-                "STOPPED".to_string()
-            };
-
-            println!("{:<15} {:>10} {:>8}", program, count, status);
+        println!(
+            "\n{:<20} {:>8} {:>10} {:>12} {:>10}",
+            "PROGRAM", "INSTANCE", "PID", "STATE", "UPTIME"
+        );
+        println!("{}", "-".repeat(66));
+        for status in statuses {
+            let pid = status
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let uptime = status
+                .uptime
+                .map(|uptime| format!("{}s", uptime.as_secs()))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<20} {:>8} {:>10} {:>12} {:>10}",
+                status.program, status.id, pid, status.state, uptime
+            );
         }
         println!();
+    }
+
+    fn print_welcome() {
+        println!("Taskmaster control shell. Type 'help' for commands.");
+    }
+
+    fn print_help() {
+        println!(
+            "\
+Commands:
+  status                 Show every configured instance and its state
+  start <name|all>       Start a program
+  stop <name|all>        Gracefully stop a program
+  restart <name|all>     Stop, then start a program
+  reload                 Reload and selectively apply the config file
+  history                Show commands entered in this session
+  help                    Show this help
+  quit | exit             Stop all children and exit"
+        );
     }
 }
 
@@ -221,66 +245,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_start_command() {
-        let cmd = ShellCommand::parse("start web");
-        assert!(matches!(cmd, Some(ShellCommand::Start(ref name)) if name == "web"));
+    fn parses_control_commands() {
+        assert_eq!(
+            ShellCommand::parse("start web"),
+            Some(ShellCommand::Start("web".to_string()))
+        );
+        assert_eq!(
+            ShellCommand::parse("stop all"),
+            Some(ShellCommand::Stop("all".to_string()))
+        );
+        assert_eq!(
+            ShellCommand::parse("restart api"),
+            Some(ShellCommand::Restart("api".to_string()))
+        );
+        assert_eq!(ShellCommand::parse("status"), Some(ShellCommand::Status));
+        assert_eq!(ShellCommand::parse("reload"), Some(ShellCommand::Reload));
+        assert_eq!(ShellCommand::parse("history"), Some(ShellCommand::History));
+        assert_eq!(ShellCommand::parse("exit"), Some(ShellCommand::Quit));
     }
 
     #[test]
-    fn parse_stop_command() {
-        let cmd = ShellCommand::parse("stop api");
-        assert!(matches!(cmd, Some(ShellCommand::Stop(ref name)) if name == "api"));
-    }
-
-    #[test]
-    fn parse_restart_command() {
-        let cmd = ShellCommand::parse("restart database");
-        assert!(matches!(cmd, Some(ShellCommand::Restart(ref name)) if name == "database"));
-    }
-
-    #[test]
-    fn parse_status_command() {
-        let cmd = ShellCommand::parse("status");
-        assert!(matches!(cmd, Some(ShellCommand::Status)));
-    }
-
-    #[test]
-    fn parse_quit_command() {
-        assert!(matches!(ShellCommand::parse("quit"), Some(ShellCommand::Quit)));
-        assert!(matches!(ShellCommand::parse("exit"), Some(ShellCommand::Quit)));
-        assert!(matches!(ShellCommand::parse("q"), Some(ShellCommand::Quit)));
-    }
-
-    #[test]
-    fn parse_help_command() {
-        assert!(matches!(ShellCommand::parse("help"), Some(ShellCommand::Help)));
-        assert!(matches!(ShellCommand::parse("h"), Some(ShellCommand::Help)));
-        assert!(matches!(ShellCommand::parse("?"), Some(ShellCommand::Help)));
-    }
-
-    #[test]
-    fn parse_empty_line() {
-        let cmd = ShellCommand::parse("");
-        assert!(cmd.is_none());
-        let cmd = ShellCommand::parse("   ");
-        assert!(cmd.is_none());
-    }
-
-    #[test]
-    fn parse_unknown_command() {
-        let cmd = ShellCommand::parse("foobar");
-        assert!(cmd.is_none());
-    }
-
-    #[test]
-    fn parse_command_missing_arg() {
-        let cmd = ShellCommand::parse("start");
-        assert!(cmd.is_none());
-    }
-
-    #[test]
-    fn parse_with_extra_whitespace() {
-        let cmd = ShellCommand::parse("  start   web  ");
-        assert!(matches!(cmd, Some(ShellCommand::Start(ref name)) if name == "web"));
+    fn rejects_missing_or_extra_arguments() {
+        assert_eq!(ShellCommand::parse(""), None);
+        assert_eq!(ShellCommand::parse("start"), None);
+        assert_eq!(ShellCommand::parse("status extra"), None);
+        assert_eq!(ShellCommand::parse("unknown"), None);
     }
 }

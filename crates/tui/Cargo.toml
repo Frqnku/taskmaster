@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 process = { path = "../process" }
 config = { path = "../config" }
+signals = { path = "../signals" }

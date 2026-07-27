@@ -8,37 +8,43 @@ use serde::Deserialize;
 /// Validate a signal name (Unix)
 #[cfg(unix)]
 fn is_valid_signal(name: &str) -> bool {
-	if let Ok(n) = name.parse::<i32>() {
-		return n > 0 && n < 65;
-	}
-	matches!(
-		name.trim().to_uppercase().as_str(),
-		"SIGTERM" | "TERM" | "SIGKILL" | "KILL" | "SIGINT" | "INT" | 
-		"SIGHUP" | "HUP" | "SIGQUIT" | "QUIT" | "SIGUSR1" | "USR1" | 
-		"SIGUSR2" | "USR2"
-	)
+    if let Ok(n) = name.parse::<i32>() {
+        return n > 0 && n < 65;
+    }
+    matches!(
+        name.trim().to_uppercase().as_str(),
+        "SIGTERM"
+            | "TERM"
+            | "SIGKILL"
+            | "KILL"
+            | "SIGINT"
+            | "INT"
+            | "SIGHUP"
+            | "HUP"
+            | "SIGQUIT"
+            | "QUIT"
+            | "SIGUSR1"
+            | "USR1"
+            | "SIGUSR2"
+            | "USR2"
+    )
 }
 
 #[cfg(not(unix))]
 fn is_valid_signal(_name: &str) -> bool {
-	true
+    true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AutoRestart {
     Always,
+    #[default]
     Never,
     Unexpected,
 }
 
-impl Default for AutoRestart {
-    fn default() -> Self {
-        AutoRestart::Never
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Program {
     pub cmd: String,
@@ -72,7 +78,7 @@ impl Default for Program {
             exitcodes: vec![0],
             startretries: 0,
             starttime: 1,
-            stopsignal: None,
+            stopsignal: Some("TERM".to_string()),
             stoptime: 5,
             stdout: None,
             stderr: None,
@@ -84,18 +90,10 @@ impl Default for Program {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub programs: HashMap<String, Program>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            programs: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -124,7 +122,7 @@ impl Config {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let s = fs::read_to_string(path.as_ref()).map_err(ConfigError::Io)?;
         let cfg: Config = toml::from_str(&s).map_err(ConfigError::Parse)?;
-        cfg.validate().map(|_| cfg).map_err(|e| ConfigError::Validation(e))
+        cfg.validate().map(|_| cfg).map_err(ConfigError::Validation)
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -139,26 +137,26 @@ impl Config {
             if p.numprocs == 0 {
                 return Err(format!("program '{}' numprocs must be >= 1", name));
             }
-            if p.starttime == 0 {
-                return Err(format!("program '{}' starttime must be >= 1", name));
-            }
-            if p.stoptime == 0 {
-                return Err(format!("program '{}' stoptime must be >= 1", name));
-            }
             if p.exitcodes.is_empty() {
                 return Err(format!("program '{}' exitcodes must not be empty", name));
             }
-            
+
             // Validate stopsignal if configured
-            if let Some(sig) = &p.stopsignal {
-                if !is_valid_signal(sig) {
-                    return Err(format!("program '{}' has invalid stopsignal: {}", name, sig));
-                }
+            if let Some(sig) = &p.stopsignal
+                && !is_valid_signal(sig)
+            {
+                return Err(format!(
+                    "program '{}' has invalid stopsignal: {}",
+                    name, sig
+                ));
             }
-            
+
             // Validate startretries is reasonable
             if p.startretries > 1000 {
-                return Err(format!("program '{}' startretries too high (max 1000)", name));
+                return Err(format!(
+                    "program '{}' startretries too high (max 1000)",
+                    name
+                ));
             }
         }
 
@@ -180,7 +178,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_nanos();
-        path.push(format!("taskmaster-{}-{}-{}.toml", name, std::process::id(), unique));
+        path.push(format!(
+            "taskmaster-{}-{}-{}.toml",
+            name,
+            std::process::id(),
+            unique
+        ));
         fs::write(&path, content).expect("write temp config");
         path
     }
@@ -196,6 +199,7 @@ mod tests {
         assert_eq!(program.startretries, 0);
         assert_eq!(program.starttime, 1);
         assert_eq!(program.stoptime, 5);
+        assert_eq!(program.stopsignal.as_deref(), Some("TERM"));
         assert!(program.stdout.is_none());
         assert!(program.stderr.is_none());
     }
@@ -264,9 +268,34 @@ PORT = "8080"
         assert_eq!(program.stderr.as_deref(), Some("/tmp/api.err"));
         assert_eq!(program.workingdir.as_deref(), Some("/tmp"));
         assert_eq!(program.umask, Some(18));
-        assert_eq!(program.env.as_ref().and_then(|env| env.get("RUST_LOG")), Some(&"debug".to_string()));
-        assert_eq!(program.env.as_ref().and_then(|env| env.get("PORT")), Some(&"8080".to_string()));
+        assert_eq!(
+            program.env.as_ref().and_then(|env| env.get("RUST_LOG")),
+            Some(&"debug".to_string())
+        );
+        assert_eq!(
+            program.env.as_ref().and_then(|env| env.get("PORT")),
+            Some(&"8080".to_string())
+        );
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepts_zero_start_and_stop_times() {
+        let path = temp_file(
+            "config-zero-times",
+            r#"
+[programs.oneshot]
+cmd = "exit 0"
+starttime = 0
+stoptime = 0
+"#,
+        );
+
+        let config = Config::load_from_path(&path).expect("zero times should be valid");
+        let program = config.programs.get("oneshot").expect("missing program");
+        assert_eq!(program.starttime, 0);
+        assert_eq!(program.stoptime, 0);
         let _ = fs::remove_file(path);
     }
 
