@@ -45,7 +45,7 @@ pub enum AutoRestart {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Program {
     pub cmd: String,
     pub numprocs: usize,
